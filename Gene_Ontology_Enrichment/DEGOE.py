@@ -4,45 +4,32 @@ DEGOE: Differential Expression -> Gene Ontology Enrichment
 v1.0 (2025)
 Written by E. J. Bentz
 
-DEGOE takes differential-expression results tables from DESeq or generic scores 
-from either single files or whole folders with multiple files to process in batch.
-It performs Gene Ontology enrichment using flaxible and tunable methods, and creates 
-summaries and usable output in one step, without the need to manually create score files.
-It is designed for quick, repeatable runs. Most jobs finish in under a minute.
+DEGOE performs Gene Ontology enrichment analyses using differential expression
+results from DESeq2 directly, without the need to manually create scores files.
 
-Key capabilities:
- - Load DESeq2 results and extract scores automatically
- - Batch-process every score file in a given directory
- - Expand GO annotations with ancestor terms from the go.obo definitions file
- - Apply optional GO-level and category-size filters
- - Optionally collapse redundant GO terms by shared genes and keep only the
-     most informative representative per cluster.
- - Run either Mann–Whitney U (rank-based) or Fisher’s exact tests to find GO
-     categories enriched and apply Benjamini–Hochberg FDR 
- - Log parameters used for every run
+Analyses use well-supported methods with flexible and tunable parameters.
 
-Tests available:
+The script is highly parallelized and efficient, and it generally runs
+GO enrichment on a whole directory of input files in about a minute.
+
+This version works on Linux and Windows, but it requires external python modules
+Future versions will include these modules as part of the package.
+
+Tests:
   - Mann–Whitney U (MWU) enrichment (Non-thresholded test)
   - Fisher's exact test enrichment (Thresholded input)
-
-(Future versions are planned to include methods such as GSEA and ORA)
+  (I may add GSEA, ORA, or other methods in the future)
 
 """
-
 import os
 import sys
+import platform
 import argparse
 import logging
 from pathlib import Path
 from datetime import datetime
 from collections import defaultdict
 
-import numpy as np
-import pandas as pd
-from scipy import stats
-from scipy.cluster.hierarchy import linkage, fcluster
-
-# Limit threads for BLAS/OpenMP libraries before importing anything heavy
 def _get_cpu_arg_for_env():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument('--cpus', type=int, default=1)
@@ -50,19 +37,57 @@ def _get_cpu_arg_for_env():
     return args.cpus
 
 _n_cpus = _get_cpu_arg_for_env()
-os.environ['OPENBLAS_NUM_THREADS'] = str(_n_cpus)
-os.environ['MKL_NUM_THREADS'] = str(_n_cpus)
-os.environ['OMP_NUM_THREADS'] = str(_n_cpus)
-os.environ['BLIS_NUM_THREADS'] = str(_n_cpus)
-os.environ['NUMEXPR_NUM_THREADS'] = str(_n_cpus)
-os.environ['VECLIB_MAXIMUM_THREADS'] = str(_n_cpus)
 
-# Logging
+# For Windows
+if os.name == "nt":
+    os.environ["OPENBLAS_MAIN_FREE"] = "1"
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_n_cpus)
+    os.environ["OMP_NUM_THREADS"] = str(_n_cpus)
+    os.environ["MKL_NUM_THREADS"] = str(_n_cpus)
+    os.environ["BLIS_NUM_THREADS"] = str(_n_cpus)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_n_cpus)
+# For Linux
+else:
+    os.environ["OPENBLAS_NUM_THREADS"] = str(_n_cpus)
+    os.environ["OMP_NUM_THREADS"] = str(_n_cpus)
+    os.environ["MKL_NUM_THREADS"] = str(_n_cpus)
+    os.environ["BLIS_NUM_THREADS"] = str(_n_cpus)
+    os.environ["NUMEXPR_NUM_THREADS"] = str(_n_cpus)
+
+import numpy as np
+import pandas as pd
+from scipy import stats
+from scipy.cluster.hierarchy import linkage, fcluster
+from multiprocessing import Pool, cpu_count
+from functools import partial
+from collections import deque
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
 logger = logging.getLogger(__name__)
+
+UNIQUE_GENE_COL = "__gene_instance__"
+
+
+def _assign_unique_gene_ids(scores: pd.DataFrame) -> pd.DataFrame:
+    """
+    Return a copy of the scores table with a column that guarantees
+    unique identifiers for every gene entry, even when names repeat.
+    """
+    result = scores.copy()
+    if UNIQUE_GENE_COL not in result.columns:
+        result[UNIQUE_GENE_COL] = result["gene"].astype(str)
+    counts = result.groupby("gene").cumcount()
+    dup_mask = counts > 0
+    if dup_mask.any():
+        result.loc[dup_mask, UNIQUE_GENE_COL] = (
+            result.loc[dup_mask, UNIQUE_GENE_COL]
+            + "__dup"
+            + counts[dup_mask].astype(str)
+        )
+    return result
 
 
 ############################
@@ -164,12 +189,7 @@ class GOHierarchy:
                     if current_ns == self.namespace:
                         self.parents[current_id].add(parent_id)
 
-                # At the end of a term block, if namespace matches, record the term
-                # This is done by checking when we see the next "[Term]" or EOF.
-                # The simple implementation above depends on the last values seen.
-
-        # Second pass to collect names and filter to namespace
-        # Some OBOs do not repeat namespace information near parents, so we re-parse for names.
+        # Second pass
         current_id = None
         current_name = None
         current_ns = None
@@ -215,25 +235,32 @@ class GOHierarchy:
 
     def _compute_levels(self):
         """
-        Compute approximate hierarchy levels using BFS from roots.
+        Compute approximate hierarchy levels using optimized BFS from roots.
         A root is any term with no parents in this namespace.
         """
+        # First, build a reverse index: parent -> list of children
+        # This is MUCH faster than searching through all parents for each term
+        children = defaultdict(list)
+        for child, parents in self.parents.items():
+            for parent in parents:
+                children[parent].append(child)
+
+        # Find roots (terms with no parents)
         roots = [t for t in self.names if not self.parents.get(t)]
-        level = {}
-        from collections import deque
+
         q = deque()
+        level = {}
 
         for r in roots:
             q.append((r, 0))
+            level[r] = 0
 
         while q:
             term, lvl = q.popleft()
-            if term in level:
-                continue
-            level[term] = lvl
-            # Children are any terms that list this term as a parent
-            for child, parents in self.parents.items():
-                if term in parents and child not in level:
+            # Process all children of this term
+            for child in children[term]:
+                if child not in level:
+                    level[child] = lvl + 1
                     q.append((child, lvl + 1))
 
         self.levels = level
@@ -259,7 +286,43 @@ class GOHierarchy:
         return seen
 
 
-def load_annotations(annotation_file: str, go_hierarchy: GOHierarchy) -> pd.DataFrame:
+def _process_gene_annotation(args):
+    """
+    Process a single gene's GO annotations and expand with ancestors.
+    Must be a top-level function for Windows multiprocessing pickle compatibility.
+    """
+    gene, terms_str, go_names, go_levels, go_ancestors_cache = args
+
+    if pd.isna(terms_str) or not terms_str or terms_str == "unknown":
+        return None
+
+    base_terms = {t.strip() for t in terms_str.split(";") if t.strip()}
+    expanded_terms = set()
+
+    for t in base_terms:
+        if t in go_names:
+            expanded_terms.add(t)
+            # Use cached ancestors
+            if t in go_ancestors_cache:
+                expanded_terms.update(go_ancestors_cache[t])
+
+    expanded_terms = {t for t in expanded_terms if t in go_names}
+    if not expanded_terms:
+        return None
+
+    sorted_terms = sorted(expanded_terms)
+    records = []
+    for t in expanded_terms:
+        records.append({
+            "gene": gene,
+            "go_term": t,
+            "go_name": go_names.get(t, t),
+            "level": go_levels.get(t, -1)
+        })
+    return gene, sorted_terms, records
+
+
+def load_annotations(annotation_file: str, go_hierarchy: GOHierarchy, n_cpus: int | None = None) -> tuple:
     """
     Load gene-to-GO annotations from a tab-delimited file:
       gene_id  GO:0000001;GO:0000002;...
@@ -267,6 +330,9 @@ def load_annotations(annotation_file: str, go_hierarchy: GOHierarchy) -> pd.Data
     Returns a DataFrame with columns:
       gene, go_term, go_name, level
     """
+    if n_cpus is None:
+        n_cpus = _n_cpus
+
     logger.info(f"Loading annotations from '{annotation_file}'")
     raw = pd.read_csv(
         annotation_file,
@@ -276,42 +342,40 @@ def load_annotations(annotation_file: str, go_hierarchy: GOHierarchy) -> pd.Data
         dtype=str
     )
 
-    records = []
+    logger.info(f"Expanding GO annotations for {len(raw)} genes")
+
+    # Pre-compute all ancestors for all GO terms to avoid redundant computation
+    go_ancestors_cache = {}
+    for term in go_hierarchy.names.keys():
+        go_ancestors_cache[term] = go_hierarchy.ancestors(term)
+
+    # Prepare arguments for parallel processing
+    args_list = [
+        (row["gene"], row["go_terms"], go_hierarchy.names, go_hierarchy.levels, go_ancestors_cache)
+        for _, row in raw.iterrows()
+    ]
+
+    if n_cpus > 1:
+        with Pool(n_cpus) as pool:
+            results = pool.map(_process_gene_annotation, args_list)
+    else:
+        results = [_process_gene_annotation(args) for args in args_list]
+
+    # Collect results
     gene_to_expanded_terms = {}
+    all_records = []
 
-    for _, row in raw.iterrows():
-        gene = row["gene"]
-        terms_str = row["go_terms"]
-        if pd.isna(terms_str) or not terms_str or terms_str == "unknown":
-            continue
+    for result in results:
+        if result is not None:
+            gene, sorted_terms, records = result
+            gene_to_expanded_terms[gene] = sorted_terms
+            all_records.extend(records)
 
-        base_terms = {t.strip() for t in terms_str.split(";") if t.strip()}
-        expanded_terms = set()
-
-        for t in base_terms:
-            if t in go_hierarchy.names:
-                expanded_terms.add(t)
-                expanded_terms.update(go_hierarchy.ancestors(t))
-
-        expanded_terms = {t for t in expanded_terms if t in go_hierarchy.names}
-        if not expanded_terms:
-            continue
-
-        gene_to_expanded_terms[gene] = sorted(expanded_terms)
-
-        for t in expanded_terms:
-            records.append({
-                "gene": gene,
-                "go_term": t,
-                "go_name": go_hierarchy.names.get(t, t),
-                "level": go_hierarchy.levels.get(t, -1)
-            })
-
-    if not records:
+    if not all_records:
         logger.error("No valid gene-GO annotations found after expansion")
         sys.exit(1)
 
-    df = pd.DataFrame.from_records(records)
+    df = pd.DataFrame.from_records(all_records)
     logger.info(
         f"Expanded annotations: {df['gene'].nunique()} genes, "
         f"{df['go_term'].nunique()} GO terms, {len(df)} gene-term pairs"
@@ -444,7 +508,6 @@ class ScoreFileProcessor:
                     "but pvalue/padj columns were not found"
                 )
 
-        # Now derive a single numeric "value" column
         df_values = None
 
         if score_type == "raw":
@@ -560,7 +623,8 @@ def filter_categories_by_size(merged: pd.DataFrame,
     If both max_genes and max_genes_fraction are given, use the smaller.
     If neither is given, default max_genes = 10% of total genes.
     """
-    total_genes = merged["gene"].nunique()
+    gene_col = UNIQUE_GENE_COL if UNIQUE_GENE_COL in merged.columns else "gene"
+    total_genes = merged[gene_col].nunique()
     if max_genes_fraction is not None:
         if not (0 < max_genes_fraction <= 1.0):
             raise ValueError("max_genes_fraction must be in (0, 1]")
@@ -575,7 +639,7 @@ def filter_categories_by_size(merged: pd.DataFrame,
     if max_genes <= 0:
         raise ValueError("max_genes must be positive")
 
-    sizes = merged.groupby("go_term")["gene"].nunique()
+    sizes = merged.groupby("go_term")[gene_col].nunique()
     keep_terms = sizes[(sizes >= min_genes) & (sizes <= max_genes)].index
 
     filtered = merged[merged["go_term"].isin(keep_terms)].copy()
@@ -586,11 +650,39 @@ def filter_categories_by_size(merged: pd.DataFrame,
     return filtered
 
 
+def _compute_distance_chunk(args):
+    """
+    Compute distances for a chunk of term pairs.
+    """
+    i_start, i_end, terms, gene_sets = args
+
+    distances = []
+    for i in range(i_start, i_end):
+        genes_i = gene_sets[terms[i]]
+        len_i = len(genes_i)
+        for j in range(i + 1, len(terms)):
+            genes_j = gene_sets[terms[j]]
+            len_j = len(genes_j)
+            smaller = min(len_i, len_j)
+            if smaller == 0:
+                dist = 1.0
+            else:
+                shared = len(genes_i & genes_j)
+                dist = 1.0 - (shared / smaller)
+            distances.append(dist)
+
+    return distances
+
+
 def collapse_redundant_terms(
     annotations: pd.DataFrame,
-    cut_height: float
+    cut_height: float,
+    n_cpus: int | None = None
 ) -> pd.DataFrame:
-    """Cluster GO categories based on shared genes and merge redundant ones."""
+    """Cluster and merge GO categories"""
+
+    if n_cpus is None:
+        n_cpus = _n_cpus
 
     if cut_height <= 0:
         logger.warning("cluster cut height must be positive; skipping redundancy reduction")
@@ -612,20 +704,41 @@ def collapse_redundant_terms(
     )
 
     terms = list(gene_sets.keys())
-    condensed = []
-    for i in range(len(terms) - 1):
-        genes_i = gene_sets[terms[i]]
-        len_i = len(genes_i)
-        for j in range(i + 1, len(terms)):
-            genes_j = gene_sets[terms[j]]
-            len_j = len(genes_j)
-            smaller = min(len_i, len_j)
-            if smaller == 0:
-                dist = 1.0
-            else:
-                shared = len(genes_i & genes_j)
-                dist = 1.0 - (shared / smaller)
-            condensed.append(dist)
+
+    # Parallel distance computation
+    logger.info(f"Computing pairwise distances for {len(terms)} GO terms")
+
+    if n_cpus > 1 and len(terms) > 100:
+        # Split work into chunks for parallel processing
+        # Each chunk handles a range of 'i' values
+        chunk_size = max(1, len(terms) // (n_cpus * 4))
+        chunks = []
+        for i_start in range(0, len(terms) - 1, chunk_size):
+            i_end = min(i_start + chunk_size, len(terms) - 1)
+            chunks.append((i_start, i_end, terms, gene_sets))
+
+        with Pool(n_cpus) as pool:
+            results = pool.map(_compute_distance_chunk, chunks)
+
+        # Condense results
+        condensed = []
+        for chunk_distances in results:
+            condensed.extend(chunk_distances)
+    else:
+        condensed = []
+        for i in range(len(terms) - 1):
+            genes_i = gene_sets[terms[i]]
+            len_i = len(genes_i)
+            for j in range(i + 1, len(terms)):
+                genes_j = gene_sets[terms[j]]
+                len_j = len(genes_j)
+                smaller = min(len_i, len_j)
+                if smaller == 0:
+                    dist = 1.0
+                else:
+                    shared = len(genes_i & genes_j)
+                    dist = 1.0 - (shared / smaller)
+                condensed.append(dist)
 
     if not condensed:
         logger.info("Redundancy reduction skipped (insufficient term pairs)")
@@ -727,6 +840,41 @@ def add_bh_fdr(results: pd.DataFrame) -> pd.DataFrame:
 # MANN–WHITNEY U ENRICHMENT
 ############################
 
+def _mwu_test_wrapper(args):
+    """
+    Wrapper function for parallel MWU testing.
+    Must be a top-level function for Windows multiprocessing pickle compatibility.
+    """
+    term, alternative, direction, merged, gene_values, gene_ranks, all_genes = args
+
+    mask = merged["go_term"] == term
+    genes_in_term = merged.loc[mask, UNIQUE_GENE_COL].drop_duplicates().tolist()
+    genes_in_term_set = set(genes_in_term)
+    genes_outside = [g for g in all_genes if g not in genes_in_term_set]
+    if len(genes_in_term) < 2 or len(genes_outside) < 2:
+        return None
+
+    vals_in = [gene_values[g] for g in genes_in_term]
+    vals_out = [gene_values[g] for g in genes_outside]
+    stat, pval = stats.mannwhitneyu(vals_in, vals_out, alternative=alternative)
+    ranks_in = [gene_ranks[g] for g in genes_in_term]
+    ranks_out = [gene_ranks[g] for g in genes_outside]
+    delta_rank = np.mean(ranks_in) - np.mean(ranks_out)
+    row = merged.loc[merged["go_term"] == term].iloc[0]
+
+    result = {
+        "term": term,
+        "name": row["go_name"],
+        "level": row["level"],
+        "nseqs": len(genes_in_term),
+        "delta.rank": delta_rank,
+        "pval": pval
+    }
+    if direction:
+        result["direction"] = direction
+    return result
+
+
 def run_mwu(
     scores: pd.DataFrame,
     annotations: pd.DataFrame,
@@ -735,7 +883,8 @@ def run_mwu(
     min_genes: int,
     max_genes: int | None,
     max_genes_fraction: float | None,
-    source_label: str | None = None
+    source_label: str | None = None,
+    n_cpus: int | None = None
 ) -> pd.DataFrame:
     """
     MWU enrichment on merged gene scores and GO annotations.
@@ -745,17 +894,27 @@ def run_mwu(
     test_direction options:
       - 'enriched' (non-directional, for pvalue scores)
       - 'up', 'down', 'both' (for directional scores)
+    n_cpus: Number of CPUs for parallel processing (None = use _n_cpus global)
     """
 
+    if n_cpus is None:
+        n_cpus = _n_cpus
+
+    scores_with_ids = _assign_unique_gene_ids(scores)
+
     # Merge score and annotation tables
-    merged = annotations.merge(scores, on="gene", how="inner")
+    merged = annotations.merge(scores_with_ids, on="gene", how="inner")
     if merged.empty:
         raise ValueError("No overlapping genes between scores and annotations")
 
     merged = filter_categories_by_size(merged, min_genes, max_genes, max_genes_fraction)
 
-    # Aggregate per gene to a single score (if duplicated)
-    gene_values = merged.groupby("gene")["value"].mean()
+    # Keep per-entry gene values (duplicates remain distinct via UNIQUE_GENE_COL)
+    unique_values = (
+        merged[[UNIQUE_GENE_COL, "value"]]
+        .drop_duplicates(UNIQUE_GENE_COL)
+    )
+    gene_values = unique_values.set_index(UNIQUE_GENE_COL)["value"]
     all_genes = gene_values.index.values
     all_values = gene_values.values
 
@@ -767,45 +926,30 @@ def run_mwu(
     label = source_label or getattr(scores, "source_file", "input")
     logger.info(f"MWU: testing {len(categories)} GO categories from '{label}'")
 
-    def test_category(term: str,
-                      alternative: str) -> dict | None:
-        genes_in_term = set(merged.loc[merged["go_term"] == term, "gene"])
-        genes_outside = set(all_genes) - genes_in_term
-        if len(genes_in_term) < 2 or len(genes_outside) < 2:
-            return None
-
-        vals_in = [gene_values[g] for g in genes_in_term]
-        vals_out = [gene_values[g] for g in genes_outside]
-
-        stat, pval = stats.mannwhitneyu(vals_in, vals_out, alternative=alternative)
-
-        ranks_in = [gene_ranks[g] for g in genes_in_term]
-        ranks_out = [gene_ranks[g] for g in genes_outside]
-        delta_rank = np.mean(ranks_in) - np.mean(ranks_out)
-
-        row = merged.loc[merged["go_term"] == term].iloc[0]
-        return {
-            "term": term,
-            "name": row["go_name"],
-            "level": row["level"],
-            "nseqs": len(genes_in_term),
-            "delta.rank": delta_rank,
-            "pval": pval
-        }
-
     results_rows = []
 
     if score_type == "pvalue":
         # Non-directional: larger -log10(p) means more significant.
-        # We only support 'enriched' here.
         if test_direction != "enriched":
             raise ValueError(
                 "score_type='pvalue' must be used with test_direction='enriched'"
             )
-        for term in categories:
-            res = test_category(term, alternative="greater")
-            if res is not None:
-                results_rows.append(res)
+
+        # Prepare arguments for parallel processing
+        args_list = [
+            (term, "greater", None, merged, gene_values, gene_ranks, all_genes)
+            for term in categories
+        ]
+
+        if n_cpus > 1:
+            with Pool(n_cpus) as pool:
+                results = pool.map(_mwu_test_wrapper, args_list)
+            results_rows = [r for r in results if r is not None]
+        else:
+            for args in args_list:
+                res = _mwu_test_wrapper(args)
+                if res is not None:
+                    results_rows.append(res)
 
     else:
         # Directional score types
@@ -815,18 +959,28 @@ def run_mwu(
                 "'up', 'down', or 'both'"
             )
 
+        args_list = []
+
         if test_direction in {"up", "both"}:
-            for term in categories:
-                res = test_category(term, alternative="greater")
-                if res is not None:
-                    res["direction"] = "up"
-                    results_rows.append(res)
+            args_list.extend([
+                (term, "greater", "up", merged, gene_values, gene_ranks, all_genes)
+                for term in categories
+            ])
 
         if test_direction in {"down", "both"}:
-            for term in categories:
-                res = test_category(term, alternative="less")
+            args_list.extend([
+                (term, "less", "down", merged, gene_values, gene_ranks, all_genes)
+                for term in categories
+            ])
+
+        if n_cpus > 1:
+            with Pool(n_cpus) as pool:
+                results = pool.map(_mwu_test_wrapper, args_list)
+            results_rows = [r for r in results if r is not None]
+        else:
+            for args in args_list:
+                res = _mwu_test_wrapper(args)
                 if res is not None:
-                    res["direction"] = "down"
                     results_rows.append(res)
 
     if not results_rows:
@@ -851,6 +1005,54 @@ def run_mwu(
 # FISHER'S EXACT TEST ENRICHMENT
 ############################
 
+def _fisher_test_wrapper(args):
+    """
+    Wrapper function for parallel Fisher's exact testing.
+    Must be a top-level function for Windows multiprocessing pickle compatibility.
+    """
+    from scipy.stats import fisher_exact
+
+    term, merged, sig_genes, nonsig_genes, all_genes = args
+
+    mask = merged["go_term"] == term
+    genes_in_term = set(
+        merged.loc[mask, UNIQUE_GENE_COL].drop_duplicates()
+    )
+    if not genes_in_term:
+        return None
+
+    cat_sig = len(genes_in_term & sig_genes)
+    cat_nonsig = len(genes_in_term & nonsig_genes)
+    noncat_sig = len(sig_genes - genes_in_term)
+    noncat_nonsig = len(nonsig_genes - genes_in_term)
+    table = [[cat_sig, cat_nonsig],
+             [noncat_sig, noncat_nonsig]]
+
+    # fisher_exact can handle zeros; odds_ratio may be inf.
+    odds_ratio, pval = fisher_exact(table, alternative="greater")
+
+    total_in_term = cat_sig + cat_nonsig
+    frac_sig_in_term = cat_sig / total_in_term if total_in_term > 0 else 0.0
+    frac_sig_overall = len(sig_genes) / len(all_genes)
+    enrichment_ratio = (
+        frac_sig_in_term / frac_sig_overall if frac_sig_overall > 0 else 0.0
+    )
+
+    row = merged.loc[merged["go_term"] == term].iloc[0]
+    return {
+        "term": term,
+        "name": row["go_name"],
+        "level": row["level"],
+        "nseqs": len(genes_in_term),
+        "sig_genes": cat_sig,
+        "total_genes": len(genes_in_term),
+        "enrichment_ratio": enrichment_ratio,
+        "odds_ratio": odds_ratio,
+        # delta.rank is a placeholder column to match MWU results tables
+        "delta.rank": enrichment_ratio - 1.0,
+        "pval": pval
+    }
+
 def run_fisher(
     scores: pd.DataFrame,
     annotations: pd.DataFrame,
@@ -858,15 +1060,21 @@ def run_fisher(
     min_genes: int,
     max_genes: int | None,
     max_genes_fraction: float | None,
-    source_label: str | None = None
+    source_label: str | None = None,
+    n_cpus: int | None = None
 ) -> pd.DataFrame:
     """
     Fisher's exact test enrichment using a p-value threshold to classify
     genes as significant vs non-significant.
 
-    scores: DataFrame with columns gene, value (value = raw p, 0..1)
+    scores: DataFrame with columns gene, p-value
     annotations: DataFrame with gene, go_term, go_name, level
     """
+
+    if n_cpus is None:
+        n_cpus = _n_cpus
+
+    scores_with_ids = _assign_unique_gene_ids(scores)
 
     # Check that values look like p-values
     vals = scores["value"].astype(float)
@@ -876,13 +1084,17 @@ def run_fisher(
             "Use --score-type raw with a p-value column."
         )
 
-    merged = annotations.merge(scores, on="gene", how="inner")
+    merged = annotations.merge(scores_with_ids, on="gene", how="inner")
     if merged.empty:
         raise ValueError("No overlapping genes between scores and annotations")
 
     merged = filter_categories_by_size(merged, min_genes, max_genes, max_genes_fraction)
 
-    gene_pvals = merged.groupby("gene")["value"].mean()
+    unique_pvals = (
+        merged[[UNIQUE_GENE_COL, "value"]]
+        .drop_duplicates(UNIQUE_GENE_COL)
+    )
+    gene_pvals = unique_pvals.set_index(UNIQUE_GENE_COL)["value"].astype(float)
     all_genes = set(gene_pvals.index)
     sig_genes = set(gene_pvals[gene_pvals <= p_threshold].index)
     nonsig_genes = all_genes - sig_genes
@@ -906,50 +1118,22 @@ def run_fisher(
     label = source_label or getattr(scores, "source_file", "input")
     logger.info(f"Fisher: testing {len(categories)} GO categories from '{label}'")
 
-    from scipy.stats import fisher_exact
+    # Prepare arguments for parallel processing
+    args_list = [
+        (term, merged, sig_genes, nonsig_genes, all_genes)
+        for term in categories
+    ]
 
-    rows = []
-    for term in categories:
-        genes_in_term = set(merged.loc[merged["go_term"] == term, "gene"])
-        if not genes_in_term:
-            continue
-
-        cat_sig = len(genes_in_term & sig_genes)
-        cat_nonsig = len(genes_in_term & nonsig_genes)
-        noncat_sig = len(sig_genes - genes_in_term)
-        noncat_nonsig = len(nonsig_genes - genes_in_term)
-
-        # 2x2 table:
-        #          sig   non-sig
-        # in term   a      b
-        # not term  c      d
-        table = [[cat_sig, cat_nonsig],
-                 [noncat_sig, noncat_nonsig]]
-
-        # fisher_exact can handle zeros; odds_ratio may be inf.
-        odds_ratio, pval = fisher_exact(table, alternative="greater")
-
-        total_in_term = cat_sig + cat_nonsig
-        frac_sig_in_term = cat_sig / total_in_term if total_in_term > 0 else 0.0
-        frac_sig_overall = len(sig_genes) / len(all_genes)
-        enrichment_ratio = (
-            frac_sig_in_term / frac_sig_overall if frac_sig_overall > 0 else 0.0
-        )
-
-        row = merged.loc[merged["go_term"] == term].iloc[0]
-        rows.append({
-            "term": term,
-            "name": row["go_name"],
-            "level": row["level"],
-            "nseqs": len(genes_in_term),
-            "sig_genes": cat_sig,
-            "total_genes": len(genes_in_term),
-            "enrichment_ratio": enrichment_ratio,
-            "odds_ratio": odds_ratio,
-            # delta.rank here is a placeholder to keep a similar interface to MWU
-            "delta.rank": enrichment_ratio - 1.0,
-            "pval": pval
-        })
+    if n_cpus > 1:
+        with Pool(n_cpus) as pool:
+            results = pool.map(_fisher_test_wrapper, args_list)
+        rows = [r for r in results if r is not None]
+    else:
+        rows = []
+        for args in args_list:
+            res = _fisher_test_wrapper(args)
+            if res is not None:
+                rows.append(res)
 
     if not rows:
         logger.warning("Fisher: no valid categories tested")
@@ -989,8 +1173,7 @@ def save_results(
     write_combined: bool = True
 ) -> None:
     """
-    Save main result table as TSV.
-    If a 'direction' column exists (bidirectional MWU), also save _UP and _DOWN subsets.
+    Save result tables as .tsv files
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     df = results.copy()
@@ -1015,7 +1198,7 @@ def save_results(
             subset.to_csv(out_file, sep="\t", index=False)
             logger.info(f"Saved {direction_value} results to '{out_file}'")
 
-    # Quick summary
+    # Print a summary of significant GO terms
     if not df.empty:
         n_10 = (df["p.adj"] < 0.1).sum()
         n_05 = (df["p.adj"] < 0.05).sum()
@@ -1030,7 +1213,7 @@ def save_results(
 ############################
 
 class VerticalHelpFormatter(argparse.ArgumentDefaultsHelpFormatter):
-    """Formatter that prints each option on its own line in the usage block."""
+    """Formatter to print each option on its own line so that it is readable"""
 
     def _format_usage(self, usage, actions, groups, prefix):
         if prefix is None:
@@ -1196,7 +1379,6 @@ def main():
 
     params_file = Path(args.output_dir) / "parameters.txt"
 
-    # Some basic consistency checks
     if args.method == "fisher":
         if args.score_type != "raw":
             logger.info("Overriding score_type to 'raw' for Fisher's exact test")
@@ -1210,7 +1392,7 @@ def main():
             logger.error("min-level cannot be greater than max-level")
             sys.exit(1)
 
-    # Ensure GO file
+    # check for go.obo file
     go_file = ensure_go_obo(args.go_file)
     go_hierarchy = GOHierarchy(go_file, args.namespace)
 
@@ -1244,14 +1426,14 @@ def main():
         combined_dir.mkdir(parents=True, exist_ok=True)
         up_dir = down_dir = None
 
-    # Load annotations and expand
-    annotations, expanded_map = load_annotations(args.annotations, go_hierarchy)
+    # Load annotations and expand terms
+    annotations, expanded_map = load_annotations(args.annotations, go_hierarchy, n_cpus=args.cpus)
     save_expanded_annotations(expanded_map, output_dir, args.annotations)
 
     # Level filtering
     annotations = filter_by_go_level(annotations, args.min_level, args.max_level)
     if args.reduce_redundancy:
-        annotations = collapse_redundant_terms(annotations, args.cluster_cut_height)
+        annotations = collapse_redundant_terms(annotations, args.cluster_cut_height, n_cpus=args.cpus)
 
     if args.scores:
         score_files = [Path(args.scores)]
@@ -1298,7 +1480,8 @@ def main():
                 min_genes=args.min_genes,
                 max_genes=args.max_genes,
                 max_genes_fraction=args.max_genes_fraction,
-                source_label=score_path.name
+                source_label=score_path.name,
+                n_cpus=args.cpus
             )
         else:
             results = run_fisher(
@@ -1308,7 +1491,8 @@ def main():
                 min_genes=args.min_genes,
                 max_genes=args.max_genes,
                 max_genes_fraction=args.max_genes_fraction,
-                source_label=score_path.name
+                source_label=score_path.name,
+                n_cpus=args.cpus
             )
 
         if args.output_prefix:
