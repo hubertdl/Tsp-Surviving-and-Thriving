@@ -1,4 +1,4 @@
-setwd("C:/Users/huber/Box/Dave and Ehren Collaborations and stuff/Tsp_Thermal_Paper/Annotation")
+setwd("")
 
 #clear environment
 rm(list=ls())+
@@ -21,3 +21,4 @@ library(dplyr)
 #### write annotated DE results to file ####
 
 write.csv(DE, file = "DE_Results_All_annotated.csv", row.names = FALSE)
+
