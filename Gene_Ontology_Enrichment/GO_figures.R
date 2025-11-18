@@ -1,6 +1,6 @@
 # the following will plot the top significant go terms for each tissue and treatment
 
-setwd("C:/Users/huber/Box/Dave and Ehren Collaborations and stuff/Tsp_Thermal_Paper/Github/GO")
+setwd("")
 
 #clear environment
 rm(list=ls())+
@@ -49,4 +49,5 @@ p_all <- ggplot(
 
 # Print or save
 p_all
+
 
